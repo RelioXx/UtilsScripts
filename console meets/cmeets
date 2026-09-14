@@ -1,0 +1,242 @@
+(() => {
+  // 1. Idempotent cleanup: Tear down previous instances if re-injected
+  if (window.__meetTranscriptBot) {
+    window.__meetTranscriptBot.stop();
+    window.__meetTranscriptBot.removeUI();
+  }
+
+  const STORAGE_KEY = "gmeet_transcript_backup";
+  
+  // 2. Initialize transcript state from session backup (crash-resilient)
+  let transcript = [];
+  try {
+    const saved = sessionStorage.getItem(STORAGE_KEY);
+    if (saved) transcript = JSON.parse(saved);
+  } catch (e) {
+    transcript = [];
+  }
+
+  let activeSpeaker = "";
+  let currentBlockNode = null;
+
+  const pad = (n) => String(n).padStart(2, "0");
+  const getTimestamp = () => {
+    const d = new Date();
+    return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  };
+
+  // 3. Floating Overlay UI (no need to keep DevTools open)
+  const createUI = () => {
+    const existing = document.getElementById("gmeet-transcript-bar");
+    if (existing) existing.remove();
+
+    const ui = document.createElement("div");
+    ui.id = "gmeet-transcript-bar";
+    Object.assign(ui.style, {
+      position: "fixed",
+      top: "16px",
+      right: "16px",
+      zIndex: "99999",
+      backgroundColor: "rgba(32, 33, 36, 0.92)",
+      backdropFilter: "blur(6px)",
+      color: "#e8eaed",
+      padding: "10px 14px",
+      borderRadius: "10px",
+      boxShadow: "0 4px 16px rgba(0,0,0,0.3)",
+      fontFamily: "Google Sans, Roboto, sans-serif",
+      fontSize: "12px",
+      display: "flex",
+      alignItems: "center",
+      gap: "10px",
+      border: "1px solid rgba(255,255,255,0.12)"
+    });
+
+    ui.innerHTML = `
+      <div style="display:flex; align-items:center; gap:6px;">
+        <span id="transcript-rec-dot" style="width:8px; height:8px; border-radius:50%; background:#ea4335; display:inline-block; animation:pulse 1.5s infinite;"></span>
+        <span style="font-weight:600; letter-spacing:0.3px;">Live Transcript</span>
+        <span id="transcript-count" style="color:#9aa0a6; font-size:11px;">(${transcript.length} lines)</span>
+      </div>
+      <div style="display:flex; gap:6px;">
+        <button id="btn-export-txt" style="background:#3c4043; border:none; color:#fff; padding:4px 8px; border-radius:4px; cursor:pointer; font-size:11px;">TXT</button>
+        <button id="btn-export-md" style="background:#1a73e8; border:none; color:#fff; padding:4px 8px; border-radius:4px; cursor:pointer; font-size:11px; font-weight:500;">Markdown</button>
+        <button id="btn-stop-bot" style="background:transparent; border:1px solid #5f6368; color:#9aa0a6; padding:4px 8px; border-radius:4px; cursor:pointer; font-size:11px;">Stop</button>
+      </div>
+    `;
+
+    // Add pulse animation style
+    const styleSheet = document.createElement("style");
+    styleSheet.innerText = `@keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.3; } 100% { opacity: 1; } }`;
+    document.head.appendChild(styleSheet);
+
+    document.body.appendChild(ui);
+
+    // Event listeners
+    document.getElementById("btn-export-txt").onclick = () => exportFile("txt");
+    document.getElementById("btn-export-md").onclick = () => exportFile("md");
+    document.getElementById("btn-stop-bot").onclick = () => window.__meetTranscriptBot.stop();
+
+    return ui;
+  };
+
+  const updateUICounter = () => {
+    const counter = document.getElementById("transcript-count");
+    if (counter) counter.innerText = `(${transcript.length} entries)`;
+  };
+
+  // 4. Persistence to guard against tab crash or accidental refresh
+  const saveState = () => {
+    try {
+      sessionStorage.setItem(STORAGE_KEY, JSON.stringify(transcript));
+    } catch (e) { /* storage quota edge cases */ }
+    updateUICounter();
+  };
+
+  // 5. Targeted observer: Scans dedicated subtitle containers instead of entire DOM tree
+  const captionObserver = new MutationObserver(() => {
+    // Google Meet renders subtitle turns inside containers with data-sender-name, aria-live, or specific role wrappers
+    const speechBlocks = document.querySelectorAll(
+      "[data-sender-name], [aria-live='polite'] > div, [aria-live='assertive'] > div"
+    );
+
+    speechBlocks.forEach((block) => {
+      // Resolve speaker identifier
+      let speaker = block.getAttribute("data-sender-name");
+      if (!speaker) {
+        const nameEl = block.querySelector("[class*='sender'], .zsBWbe, .adE9");
+        speaker = nameEl ? nameEl.textContent.trim() : null;
+      }
+
+      // Extract spoken content
+      const textEls = block.querySelectorAll("span, [jsname]");
+      let fullText = "";
+      if (textEls.length > 0) {
+        fullText = Array.from(textEls)
+          .map((el) => el.textContent)
+          .filter(Boolean)
+          .join(" ")
+          .replace(/\s+/g, " ")
+          .trim();
+      } else {
+        fullText = block.textContent.trim();
+      }
+
+      if (!fullText) return;
+
+      const currentTime = getTimestamp();
+
+      // New speaker or new speech bubble detected
+      if (speaker && speaker !== activeSpeaker) {
+        activeSpeaker = speaker;
+        currentBlockNode = block;
+        transcript.push({
+          time: currentTime,
+          speaker: activeSpeaker,
+          text: fullText
+        });
+        saveState();
+      } else if (transcript.length > 0) {
+        // Same speaker: dynamically amend ongoing sentence stream
+        const lastEntry = transcript[transcript.length - 1];
+        if (fullText !== lastEntry.text) {
+          // Replace with latest revision if it's an expansion of words
+          if (fullText.startsWith(lastEntry.text) || fullText.length > lastEntry.text.length) {
+            lastEntry.text = fullText;
+          } else if (!lastEntry.text.includes(fullText)) {
+            lastEntry.text += ` ${fullText}`;
+          }
+          lastEntry.time = currentTime; // Update timestamp to last spoken fragment
+          saveState();
+        }
+      }
+    });
+  });
+
+  // 6. Ensure captions are active; auto-click CC button if off
+  const ensureCaptionsActive = () => {
+    const ccBtn = document.querySelector("button[aria-label*='caption' i], button[data-tooltip*='caption' i]");
+    const isCaptionsOn = ccBtn && (ccBtn.getAttribute("aria-pressed") === "true" || ccBtn.classList.contains("M9Bg4d"));
+    if (ccBtn && !isCaptionsOn) {
+      ccBtn.click();
+      console.log("%c[Transcript Bot] Automatically turned on closed captions.", "color: #1a73e8;");
+    }
+  };
+
+  // 7. Exporters
+  const exportFile = (format = "md") => {
+    if (!transcript.length) {
+      alert("No transcript records captured yet. Speak or make sure audio is running.");
+      return;
+    }
+
+    const padZero = (n) => String(n).padStart(2, "0");
+    const now = new Date();
+    const dateTag = `${now.getFullYear()}-${padZero(now.getMonth() + 1)}-${padZero(now.getDate())}_${padZero(now.getHours())}${padZero(now.getMinutes())}`;
+    
+    let content = "";
+    let mimeType = "text/plain";
+    let filename = `Meet-Transcript-${dateTag}.${format}`;
+
+    if (format === "md") {
+      mimeType = "text/markdown;charset=utf-8";
+      content = `# Meeting Transcript (${now.toLocaleDateString()} ${now.toLocaleTimeString()})\n\n---\n\n`;
+      content += transcript
+        .map((t) => `**[${t.time}] ${t.speaker}:**\n${t.text}\n`)
+        .join("\n");
+    } else {
+      mimeType = "text/plain;charset=utf-8";
+      content = transcript
+        .map((t) => `[${t.time}] ${t.speaker}:\n${t.text}\n`)
+        .join("\n");
+    }
+
+    const blob = new Blob([content], { type: mimeType });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  // 8. Start monitoring
+  ensureCaptionsActive();
+  const ui = createUI();
+
+  captionObserver.observe(document.body, {
+    childList: true,
+    subtree: true,
+    characterData: true
+  });
+
+  // Guard against accidental tab closure
+  window.addEventListener("beforeunload", () => {
+    saveState();
+  });
+
+  // 9. API Exposure
+  window.__meetTranscriptBot = {
+    data: transcript,
+    exportTXT: () => exportFile("txt"),
+    exportMD: () => exportFile("md"),
+    clear: () => {
+      transcript = [];
+      sessionStorage.removeItem(STORAGE_KEY);
+      updateUICounter();
+    },
+    removeUI: () => {
+      const el = document.getElementById("gmeet-transcript-bar");
+      if (el) el.remove();
+    },
+    stop: () => {
+      captionObserver.disconnect();
+      const dot = document.getElementById("transcript-rec-dot");
+      if (dot) dot.style.background = "#5f6368";
+      console.log("%c[Transcript Bot] Recording stopped.", "color: #ea4335; font-weight: bold;");
+    }
+  };
+
+  console.log("%c[Transcript Bot v2] Running. Use floating bar or run __meetTranscriptBot.exportMD()", "color: #1a73e8; font-weight: bold;");
+})();
