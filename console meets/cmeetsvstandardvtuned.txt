@@ -1,0 +1,881 @@
+/**
+ * TranscripTonic Pro - Standalone Google Meet Transcription & Meeting Intelligence
+ * Enterprise Edition (Trusted Types Compliant, Zero-dependency, Strict CSP Safe)
+ */
+(() => {
+    if (window.__transcriptonicPro) {
+        console.log("%c[TranscripTonic Pro] Restarting session...", "color: #FFA500; font-weight: bold;");
+        window.__transcriptonicPro.stop(false);
+    }
+
+    const SELECTORS = {
+        USER_NAME: ".awLEm",
+        MEETING_TITLE: ".u6vdEc",
+        GOOGLE_SYMBOLS: ".google-symbols",
+        TEXT_CALL_END: "call_end",
+        TEXT_CAPTIONS_OFF: "closed_caption_off",
+        TEXT_CAPTIONS_ON: "closed_caption",
+        TEXT_CHAT: "chat",
+        TRANSCRIPT_REGION: 'div[role="region"][tabindex="0"]',
+        CHAT_LIVE_REGION: 'div[aria-live="polite"].Ge9Kpc'
+    };
+
+    const TIMEFORMAT = {
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+        hour12: true
+    };
+
+    const YOU_IDENTIFIERS = ["you", "tú", "tu", "vous", "sie", "du", "você", "вы", "io", "u"];
+
+    const mutationConfig = {
+        childList: true,
+        attributes: true,
+        subtree: true,
+        characterData: true
+    };
+
+    const STORAGE_KEY = "transcriptonic_pro_active_session";
+    const HISTORY_KEY = "transcriptonic_pro_history";
+
+    const state = {
+        meetingSoftware: "Google Meet",
+        userName: "You",
+        transcript: [],
+        chatMessages: [],
+        stateTranscriptBlock: {
+            timestamp: "",
+            mutationTargetElement: null,
+            personName: "",
+            transcriptTextBuffer: ""
+        },
+        meetingStartTimestamp: new Date().toISOString(),
+        meetingTitle: "Meeting",
+        transcriptTargetNode: null,
+        transcriptObserver: null,
+        chatMessagesTargetNode: null,
+        chatMessagesObserver: null,
+        hasMeetingEnded: false,
+        captionsHidden: false,
+        monitorInterval: null,
+        chatMonitorInterval: null,
+        timerInterval: null,
+        blinkInterval: null,
+        uiElement: null,
+        isCollapsed: false
+    };
+
+    function saveToStorage() {
+        try {
+            const payload = {
+                meetingSoftware: state.meetingSoftware,
+                meetingTitle: state.meetingTitle,
+                meetingStartTimestamp: state.meetingStartTimestamp,
+                transcript: state.transcript,
+                chatMessages: state.chatMessages,
+                lastUpdated: new Date().toISOString()
+            };
+            localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
+        } catch (e) {}
+    }
+
+    function detectMeetingTitle() {
+        const titleEl = document.querySelector(SELECTORS.MEETING_TITLE);
+        if (titleEl && titleEl.innerText?.trim()) {
+            state.meetingTitle = titleEl.innerText.trim();
+            return;
+        }
+
+        let cleanTitle = document.title
+            .replace(/^Meet\s*[-–—]\s*/i, "")
+            .replace(/\s*[-–—]\s*Google Meet$/i, "")
+            .replace(/\s*[-–—]\s*Meet$/i, "")
+            .trim();
+
+        if (cleanTitle && cleanTitle !== "Meet") {
+            state.meetingTitle = cleanTitle;
+            return;
+        }
+
+        const pathCode = window.location.pathname.replace(/^\//, "");
+        if (pathCode) state.meetingTitle = `Meeting-${pathCode}`;
+    }
+
+    function detectUserName() {
+        const userEl = document.querySelector(SELECTORS.USER_NAME);
+        if (userEl && userEl.textContent?.trim()) {
+            state.userName = userEl.textContent.trim();
+        }
+    }
+
+    function pushBufferToTranscript() {
+        if (state.stateTranscriptBlock.personName && state.stateTranscriptBlock.transcriptTextBuffer) {
+            const rawName = state.stateTranscriptBlock.personName.trim();
+            const isLocalUser = YOU_IDENTIFIERS.includes(rawName.toLowerCase());
+            const personName = isLocalUser ? state.userName : rawName;
+
+            const cleanText = state.stateTranscriptBlock.transcriptTextBuffer.trim();
+            if (cleanText) {
+                state.transcript.push({
+                    personName: personName,
+                    timestamp: state.stateTranscriptBlock.timestamp || new Date().toISOString(),
+                    transcriptText: cleanText
+                });
+                state.stateTranscriptBlock.personName = "";
+                state.stateTranscriptBlock.transcriptTextBuffer = "";
+                state.stateTranscriptBlock.mutationTargetElement = null;
+
+                saveToStorage();
+                updateUI();
+            }
+        }
+    }
+
+    function resolveSpeakerName(mutationTargetElement) {
+        let name = mutationTargetElement.previousSibling?.textContent?.trim();
+        if (!name) {
+            const parent = mutationTargetElement.parentElement;
+            name = parent?.querySelector('[data-sender-name]')?.textContent?.trim()
+                || parent?.firstElementChild?.textContent?.trim();
+        }
+        return name || "Speaker";
+    }
+
+    function transcriptMutationCallback(mutationsList) {
+        mutationsList.forEach((mutation) => {
+            try {
+                if (mutation.type === "characterData") {
+                    const mutationTargetElement = mutation.target.parentElement;
+                    if (!mutationTargetElement) return;
+
+                    const transcriptUIBlocks = [...mutationTargetElement.parentElement?.parentElement?.children || []];
+                    const isLastButSecondElement = transcriptUIBlocks.length >= 3
+                        ? transcriptUIBlocks[transcriptUIBlocks.length - 3] === mutationTargetElement.parentElement
+                        : (transcriptUIBlocks.length > 0 && transcriptUIBlocks[transcriptUIBlocks.length - 1] === mutationTargetElement.parentElement);
+
+                    if (isLastButSecondElement) {
+                        const currentPersonName = resolveSpeakerName(mutationTargetElement);
+                        const currentTranscriptText = mutationTargetElement.textContent;
+
+                        if (currentPersonName && currentTranscriptText) {
+                            if (!state.stateTranscriptBlock.mutationTargetElement) {
+                                state.stateTranscriptBlock.mutationTargetElement = mutationTargetElement;
+                                state.stateTranscriptBlock.personName = currentPersonName;
+                                state.stateTranscriptBlock.timestamp = new Date().toISOString();
+                                state.stateTranscriptBlock.transcriptTextBuffer = currentTranscriptText;
+                            } else {
+                                if (state.stateTranscriptBlock.mutationTargetElement !== mutationTargetElement) {
+                                    pushBufferToTranscript();
+
+                                    state.stateTranscriptBlock.mutationTargetElement = mutationTargetElement;
+                                    state.stateTranscriptBlock.personName = currentPersonName;
+                                    state.stateTranscriptBlock.timestamp = new Date().toISOString();
+                                    state.stateTranscriptBlock.transcriptTextBuffer = currentTranscriptText;
+                                } else {
+                                    if ((currentTranscriptText.length - state.stateTranscriptBlock.transcriptTextBuffer.length) < -250) {
+                                        pushBufferToTranscript();
+                                        state.stateTranscriptBlock.mutationTargetElement = mutationTargetElement;
+                                        state.stateTranscriptBlock.timestamp = new Date().toISOString();
+                                    }
+                                    state.stateTranscriptBlock.transcriptTextBuffer = currentTranscriptText;
+                                }
+                            }
+                            updateUI();
+                        } else {
+                            pushBufferToTranscript();
+                        }
+                    }
+                }
+            } catch (err) {
+                console.error("[TranscripTonic Pro] Caption parse error:", err);
+            }
+        });
+    }
+
+    function findTranscriptContainer() {
+        return document.querySelector(SELECTORS.TRANSCRIPT_REGION)
+            || document.querySelector('div[jscontroller][aria-label*="Captions" i]')
+            || document.querySelector('div[aria-live="assertive"][tabindex="0"]');
+    }
+
+    function startTranscriptMonitor() {
+        state.transcriptTargetNode = null;
+
+        function checkNode() {
+            if (state.hasMeetingEnded) return;
+
+            const activeNode = findTranscriptContainer();
+            if (!activeNode) return;
+
+            if (!state.transcriptTargetNode || activeNode !== state.transcriptTargetNode || !state.transcriptTargetNode.isConnected) {
+                pushBufferToTranscript();
+
+                if (state.transcriptObserver) {
+                    state.transcriptObserver.disconnect();
+                }
+
+                state.transcriptTargetNode = activeNode;
+                state.transcriptObserver = new MutationObserver(transcriptMutationCallback);
+                state.transcriptObserver.observe(activeNode, mutationConfig);
+
+                if (state.captionsHidden) {
+                    applyCaptionVisibility(true);
+                }
+
+                console.log("%c[TranscripTonic Pro] Captions observer active.", "color: #2A9ACA; font-weight: bold;");
+                updateUI();
+            }
+        }
+
+        checkNode();
+        state.monitorInterval = setInterval(checkNode, 1500);
+    }
+
+    function applyCaptionVisibility(hidden) {
+        state.captionsHidden = hidden;
+        if (state.transcriptTargetNode) {
+            state.transcriptTargetNode.style.opacity = hidden ? "0" : "1";
+            state.transcriptTargetNode.style.pointerEvents = hidden ? "none" : "auto";
+        }
+        const btn = document.getElementById("tt-stealth-btn");
+        if (btn) {
+            btn.textContent = hidden ? "👁️ Show CC" : "🙈 Hide CC";
+        }
+    }
+
+    function toggleCaptionVisibility() {
+        applyCaptionVisibility(!state.captionsHidden);
+    }
+
+    function chatMessagesMutationCallback() {
+        try {
+            const chatMessagesElement = document.querySelector(SELECTORS.CHAT_LIVE_REGION);
+            if (chatMessagesElement && chatMessagesElement.children.length > 0) {
+                const chatMessageElement = chatMessagesElement.lastChild?.firstChild?.firstChild?.lastChild;
+                const personAndTimestampElement = chatMessageElement?.firstChild;
+                const rawName = (personAndTimestampElement?.childNodes.length === 1)
+                    ? state.userName
+                    : personAndTimestampElement?.firstChild?.textContent?.trim();
+
+                const isLocalUser = rawName && YOU_IDENTIFIERS.includes(rawName.toLowerCase());
+                const personName = isLocalUser ? state.userName : (rawName || "Participant");
+                const timestamp = new Date().toISOString();
+                const chatMessageText = chatMessageElement?.lastChild?.lastChild?.firstChild?.firstChild?.firstChild?.textContent?.trim();
+
+                if (personName && chatMessageText) {
+                    const isExisting = state.chatMessages.some(m =>
+                        m.personName === personName && m.chatMessageText === chatMessageText
+                    );
+                    if (!isExisting) {
+                        state.chatMessages.push({ personName, timestamp, chatMessageText });
+                        console.log(`%c[Chat] ${personName}: ${chatMessageText}`, "color: #34A853;");
+                        saveToStorage();
+                        updateUI();
+                    }
+                }
+            }
+        } catch (err) {}
+    }
+
+    function initChat() {
+        function hookChatNode() {
+            const chatNode = document.querySelector(SELECTORS.CHAT_LIVE_REGION);
+            if (chatNode && chatNode !== state.chatMessagesTargetNode) {
+                if (state.chatMessagesObserver) state.chatMessagesObserver.disconnect();
+                state.chatMessagesTargetNode = chatNode;
+                state.chatMessagesObserver = new MutationObserver(chatMessagesMutationCallback);
+                state.chatMessagesObserver.observe(chatNode, mutationConfig);
+                console.log("%c[TranscripTonic Pro] Chat messages hooked.", "color: #2A9ACA;");
+            }
+        }
+
+        hookChatNode();
+        state.chatMonitorInterval = setInterval(hookChatNode, 2500);
+    }
+
+    function ensureCaptionsTurnedOn() {
+        const offIcons = Array.from(document.querySelectorAll(SELECTORS.GOOGLE_SYMBOLS))
+            .filter(el => el.textContent?.trim() === SELECTORS.TEXT_CAPTIONS_OFF);
+
+        if (offIcons.length > 0) {
+            const btn = offIcons[0].closest("button") || offIcons[0];
+            btn.click();
+            console.log("%c[TranscripTonic Pro] Turned ON captions automatically.", "color: #2A9ACA; font-weight: bold;");
+        } else {
+            const onIcons = Array.from(document.querySelectorAll(SELECTORS.GOOGLE_SYMBOLS))
+                .filter(el => el.textContent?.trim() === SELECTORS.TEXT_CAPTIONS_ON);
+            if (onIcons.length === 0) {
+                console.warn("%c[TranscripTonic Pro] Please make sure Captions (CC) are enabled in Google Meet.", "color: #FFA500; font-weight: bold;");
+            }
+        }
+    }
+
+    function computeAnalytics() {
+        const speakers = {};
+        let totalWords = 0;
+
+        state.transcript.forEach(block => {
+            const words = block.transcriptText.split(/\s+/).filter(Boolean).length;
+            totalWords += words;
+            speakers[block.personName] = (speakers[block.personName] || 0) + words;
+        });
+
+        const speakerStats = Object.entries(speakers)
+            .map(([name, words]) => ({
+                name,
+                words,
+                percentage: totalWords ? Math.round((words / totalWords) * 100) : 0
+            }))
+            .sort((a, b) => b.words - a.words);
+
+        return { totalWords, totalBlocks: state.transcript.length, speakerStats };
+    }
+
+    function formatAsTxt() {
+        let out = `${state.meetingTitle}\nDate: ${new Date(state.meetingStartTimestamp).toLocaleString()}\n\n`;
+        out += `--------------- TRANSCRIPT ---------------\n\n`;
+        state.transcript.forEach(b => {
+            const time = new Date(b.timestamp).toLocaleString("default", TIMEFORMAT).toUpperCase();
+            out += `${b.personName} (${time})\n${b.transcriptText}\n\n`;
+        });
+        if (state.chatMessages.length > 0) {
+            out += `\n--------------- CHAT MESSAGES ---------------\n\n`;
+            state.chatMessages.forEach(c => {
+                const time = new Date(c.timestamp).toLocaleString("default", TIMEFORMAT).toUpperCase();
+                out += `${c.personName} (${time})\n${c.chatMessageText}\n\n`;
+            });
+        }
+        out += `\n---------------\nExported with TranscripTonic Pro\n---------------`;
+        return out;
+    }
+
+    function formatAsMarkdown() {
+        const { totalWords, speakerStats } = computeAnalytics();
+        let md = `# Meeting Transcript: ${state.meetingTitle}\n\n`;
+        md += `| Attribute | Details |\n|---|---|\n`;
+        md += `| **Date & Time** | ${new Date(state.meetingStartTimestamp).toLocaleString()} |\n`;
+        md += `| **Total Words** | ${totalWords.toLocaleString()} |\n`;
+        md += `| **Dialogue Turns** | ${state.transcript.length} |\n\n`;
+
+        if (speakerStats.length > 0) {
+            md += `### 👥 Speaker Participation\n\n`;
+            speakerStats.forEach(s => {
+                md += `- **${s.name}**: ${s.words} words (${s.percentage}%)\n`;
+            });
+            md += `\n`;
+        }
+
+        md += `## 💬 Spoken Transcript\n\n`;
+        state.transcript.forEach(b => {
+            const time = new Date(b.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+            md += `> **${b.personName}** *(${time})*\n>\n> ${b.transcriptText}\n\n`;
+        });
+
+        if (state.chatMessages.length > 0) {
+            md += `## 📨 In-Call Chat\n\n`;
+            state.chatMessages.forEach(c => {
+                const time = new Date(c.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+                md += `- **${c.personName}** (${time}): ${c.chatMessageText}\n`;
+            });
+            md += `\n`;
+        }
+
+        md += `---\n*Generated by TranscripTonic Pro*\n`;
+        return md;
+    }
+
+    function downloadFile(content, extension, mimeType) {
+        const invalidRegex = /[:?"*<>|~/\\\u{1}-\u{1f}\u{7f}\u{80}-\u{9f}\p{Cf}\p{Cn}]|^[.\u{0}\p{Zl}\p{Zp}\p{Zs}]|[.\u{0}\p{Zl}\p{Zp}\p{Zs}]$|^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?=\.|$)/gui;
+        const title = (state.meetingTitle || "Meeting").replaceAll(invalidRegex, "_").trim();
+        const timestamp = new Date(state.meetingStartTimestamp).toLocaleString("default", TIMEFORMAT).replace(/[\/:]/g, "-");
+        const filename = `${title} (${timestamp}).${extension}`;
+
+        const blob = new Blob([content], { type: mimeType });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        setTimeout(() => {
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+        }, 1500);
+        showToast(`Downloaded ${extension.toUpperCase()}`);
+    }
+
+    function triggerExport(format = "txt") {
+        pushBufferToTranscript();
+        if (state.transcript.length === 0 && state.chatMessages.length === 0) {
+            alert("No speech or chat recorded yet. Please ensure Captions (CC) are enabled.");
+            return;
+        }
+
+        if (format === "md") {
+            downloadFile(formatAsMarkdown(), "md", "text/markdown;charset=utf-8");
+        } else if (format === "json") {
+            downloadFile(JSON.stringify(state, null, 2), "json", "application/json;charset=utf-8");
+        } else {
+            downloadFile(formatAsTxt(), "txt", "text/plain;charset=utf-8");
+        }
+    }
+
+    function copyToClipboard(text, label = "Transcript") {
+        pushBufferToTranscript();
+        if (navigator.clipboard && window.isSecureContext) {
+            navigator.clipboard.writeText(text).then(() => {
+                showToast(`${label} copied!`);
+            }).catch(() => fallbackCopy(text, label));
+        } else {
+            fallbackCopy(text, label);
+        }
+    }
+
+    function fallbackCopy(text, label) {
+        try {
+            const ta = document.createElement("textarea");
+            ta.value = text;
+            ta.style.position = "fixed";
+            ta.style.left = "-9999px";
+            ta.style.top = "0";
+            document.body.appendChild(ta);
+            ta.focus();
+            ta.select();
+            document.execCommand("copy");
+            ta.remove();
+            showToast(`${label} copied!`);
+        } catch (e) {
+            showToast("Clipboard copy blocked.");
+            console.warn("[TranscripTonic Pro] Clipboard copy fallback failed:", e);
+        }
+    }
+
+    function stopAndExport(autoDownload = true) {
+        if (state.hasMeetingEnded) return;
+        state.hasMeetingEnded = true;
+
+        if (state.monitorInterval) clearInterval(state.monitorInterval);
+        if (state.chatMonitorInterval) clearInterval(state.chatMonitorInterval);
+        if (state.timerInterval) clearInterval(state.timerInterval);
+        if (state.blinkInterval) clearInterval(state.blinkInterval);
+        if (state.transcriptObserver) state.transcriptObserver.disconnect();
+        if (state.chatMessagesObserver) state.chatMessagesObserver.disconnect();
+
+        pushBufferToTranscript();
+        saveToStorage();
+
+        try {
+            let history = JSON.parse(localStorage.getItem(HISTORY_KEY) || "[]");
+            history.push({
+                meetingSoftware: state.meetingSoftware,
+                meetingTitle: state.meetingTitle,
+                meetingStartTimestamp: state.meetingStartTimestamp,
+                meetingEndTimestamp: new Date().toISOString(),
+                transcript: state.transcript,
+                chatMessages: state.chatMessages
+            });
+            if (history.length > 10) history = history.slice(-10);
+            localStorage.setItem(HISTORY_KEY, JSON.stringify(history));
+        } catch (e) {}
+
+        if (autoDownload && (state.transcript.length > 0 || state.chatMessages.length > 0)) {
+            triggerExport("txt");
+        }
+
+        if (state.uiElement) {
+            state.uiElement.remove();
+            state.uiElement = null;
+        }
+
+        console.log("%c[TranscripTonic Pro] Session stopped.", "color: #2A9ACA; font-weight: bold;");
+    }
+
+    function setupCallEndDetection() {
+        document.body.addEventListener("click", (e) => {
+            const target = e.target;
+            const endIcon = target.closest(`.${SELECTORS.GOOGLE_SYMBOLS.replace(".", "")}`);
+            const isEndIcon = endIcon && endIcon.textContent?.trim() === SELECTORS.TEXT_CALL_END;
+            const endBtn = target.closest('button[data-tooltip*="leave" i], button[aria-label*="leave" i], button[aria-label*="salir" i]')
+                || (isEndIcon ? (target.closest("button") || target) : null);
+
+            if (endBtn) {
+                console.log("%c[TranscripTonic Pro] Leave call clicked. Auto-exporting...", "color: #2A9ACA; font-weight: bold;");
+                stopAndExport(true);
+            }
+        }, true);
+
+        window.addEventListener("beforeunload", () => {
+            pushBufferToTranscript();
+            saveToStorage();
+        });
+
+        window.addEventListener("pagehide", () => {
+            pushBufferToTranscript();
+            saveToStorage();
+        });
+    }
+
+    function showToast(message) {
+        const toast = document.createElement("div");
+        toast.textContent = message;
+        toast.style.cssText = `
+            position: fixed;
+            top: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: #202124;
+            color: #8ab4f8;
+            padding: 8px 18px;
+            border-radius: 20px;
+            font-size: 13px;
+            font-family: 'Google Sans', Roboto, sans-serif;
+            font-weight: 500;
+            box-shadow: 0 4px 16px rgba(0,0,0,0.5);
+            border: 1px solid rgba(138,180,248,0.3);
+            z-index: 1000000;
+            pointer-events: none;
+            transition: opacity 0.3s ease;
+        `;
+        document.body.appendChild(toast);
+        setTimeout(() => {
+            toast.style.opacity = "0";
+            setTimeout(() => toast.remove(), 300);
+        }, 2000);
+    }
+
+    // Pure DOM UI Creation - Fully Trusted Types Compliant
+    function renderFloatingUI() {
+        const existing = document.getElementById("tt-pro-widget");
+        if (existing) existing.remove();
+
+        function createEl(tag, styles = {}, text = "", attrs = {}) {
+            const e = document.createElement(tag);
+            if (text) e.textContent = text;
+            Object.assign(e.style, styles);
+            for (const [k, v] of Object.entries(attrs)) {
+                e.setAttribute(k, v);
+            }
+            return e;
+        }
+
+        const widget = createEl("div", {
+            position: "fixed",
+            bottom: "84px",
+            left: "20px",
+            background: "rgba(32, 33, 36, 0.96)",
+            color: "#e8eaed",
+            padding: "10px 14px",
+            borderRadius: "14px",
+            fontFamily: "'Google Sans', Roboto, Arial, sans-serif",
+            fontSize: "12px",
+            boxShadow: "0 8px 28px rgba(0,0,0,0.5)",
+            border: "1px solid rgba(255,255,255,0.15)",
+            zIndex: "999999",
+            userSelect: "none",
+            backdropFilter: "blur(12px)",
+            minWidth: "240px",
+            cursor: "move",
+            transition: "transform 0.2s ease, opacity 0.2s ease"
+        }, "", { id: "tt-pro-widget" });
+
+        // Header
+        const header = createEl("div", {
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            marginBottom: "8px",
+            cursor: "move"
+        }, "", { id: "tt-drag-header" });
+
+        const headerLeft = createEl("div", { display: "flex", alignItems: "center", gap: "6px" });
+        const dot = createEl("span", {
+            display: "inline-block",
+            width: "8px",
+            height: "8px",
+            borderRadius: "50%",
+            background: "#34A853",
+            boxShadow: "0 0 6px #34A853",
+            transition: "opacity 0.4s ease"
+        }, "", { id: "tt-dot" });
+        const title = createEl("strong", { color: "#ffffff", fontSize: "13px" }, "TranscripTonic Pro");
+        headerLeft.appendChild(dot);
+        headerLeft.appendChild(title);
+
+        const headerRight = createEl("div", { display: "flex", alignItems: "center", gap: "6px" });
+        const timer = createEl("span", {
+            color: "#9aa0a6",
+            fontSize: "11px",
+            fontVariantNumeric: "tabular-nums"
+        }, "00:00", { id: "tt-timer" });
+        const collapseBtn = createEl("button", {
+            background: "transparent",
+            color: "#9aa0a6",
+            border: "none",
+            cursor: "pointer",
+            fontSize: "12px",
+            padding: "0 3px"
+        }, "−", { id: "tt-collapse-btn", title: "Minimize" });
+        headerRight.appendChild(timer);
+        headerRight.appendChild(collapseBtn);
+
+        header.appendChild(headerLeft);
+        header.appendChild(headerRight);
+        widget.appendChild(header);
+
+        // Body
+        const body = createEl("div", {}, "", { id: "tt-body" });
+
+        // Stats Row
+        const statsRow = createEl("div", {
+            color: "#9aa0a6",
+            fontSize: "11px",
+            marginBottom: "10px",
+            display: "flex",
+            justifyContent: "space-between"
+        }, "", { id: "tt-stats" });
+        const counter = createEl("span", {}, "0 turns • 0 words", { id: "tt-counter" });
+        const speaker = createEl("span", {
+            color: "#8ab4f8",
+            maxWidth: "90px",
+            textOverflow: "ellipsis",
+            overflow: "hidden",
+            whiteSpace: "nowrap"
+        }, "", { id: "tt-speaker" });
+        statsRow.appendChild(counter);
+        statsRow.appendChild(speaker);
+        body.appendChild(statsRow);
+
+        // Row 1: Text & Markdown Downloads
+        const row1 = createEl("div", { display: "grid", gridTemplateColumns: "1fr 1fr", gap: "6px", marginBottom: "6px" });
+        const btnTxt = createEl("button", {
+            background: "#2A9ACA",
+            color: "#fff",
+            border: "none",
+            borderRadius: "6px",
+            padding: "6px",
+            cursor: "pointer",
+            fontSize: "11px",
+            fontWeight: "500"
+        }, "📥 Text (.txt)", { id: "tt-btn-txt" });
+        const btnMd = createEl("button", {
+            background: "#1a73e8",
+            color: "#fff",
+            border: "none",
+            borderRadius: "6px",
+            padding: "6px",
+            cursor: "pointer",
+            fontSize: "11px",
+            fontWeight: "500"
+        }, "📝 Markdown", { id: "tt-btn-md" });
+        row1.appendChild(btnTxt);
+        row1.appendChild(btnMd);
+        body.appendChild(row1);
+
+        // Row 2: Copy & Stealth CC
+        const row2 = createEl("div", { display: "grid", gridTemplateColumns: "1fr 1fr", gap: "6px", marginBottom: "6px" });
+        const btnCopy = createEl("button", {
+            background: "#3c4043",
+            color: "#e8eaed",
+            border: "none",
+            borderRadius: "6px",
+            padding: "6px",
+            cursor: "pointer",
+            fontSize: "11px"
+        }, "📋 Copy Text", { id: "tt-btn-copy" });
+        const btnStealth = createEl("button", {
+            background: "#3c4043",
+            color: "#e8eaed",
+            border: "none",
+            borderRadius: "6px",
+            padding: "6px",
+            cursor: "pointer",
+            fontSize: "11px"
+        }, "🙈 Hide CC", { id: "tt-stealth-btn", title: "Hide captions from screen (continues transcribing)" });
+        row2.appendChild(btnCopy);
+        row2.appendChild(btnStealth);
+        body.appendChild(row2);
+
+        // Footer: Stop & Save Button
+        const footer = createEl("div", {
+            display: "flex",
+            justifyContent: "flex-end",
+            alignItems: "center",
+            borderTop: "1px solid rgba(255,255,255,0.08)",
+            paddingTop: "6px",
+            marginTop: "6px"
+        });
+        const btnStop = createEl("button", {
+            background: "#ea4335",
+            color: "#fff",
+            border: "none",
+            borderRadius: "6px",
+            padding: "5px 12px",
+            cursor: "pointer",
+            fontSize: "11px",
+            fontWeight: "500"
+        }, "⏹️ Stop & Save", { id: "tt-btn-stop" });
+        footer.appendChild(btnStop);
+        body.appendChild(footer);
+
+        widget.appendChild(body);
+        document.body.appendChild(widget);
+        state.uiElement = widget;
+
+        // Blinking indicator without innerHTML or <style>
+        let dotBlink = true;
+        state.blinkInterval = setInterval(() => {
+            if (!document.getElementById("tt-pro-widget")) {
+                clearInterval(state.blinkInterval);
+                return;
+            }
+            dot.style.opacity = dotBlink ? "0.4" : "1";
+            dotBlink = !dotBlink;
+        }, 800);
+
+        // Dragging Logic
+        makeDraggable(widget);
+
+        // Button Listeners
+        btnTxt.addEventListener("click", () => triggerExport("txt"));
+        btnMd.addEventListener("click", () => triggerExport("md"));
+        btnCopy.addEventListener("click", () => copyToClipboard(formatAsTxt(), "Transcript"));
+        btnStealth.addEventListener("click", toggleCaptionVisibility);
+        btnStop.addEventListener("click", () => stopAndExport(true));
+
+        // Minimize / Expand
+        collapseBtn.addEventListener("click", () => {
+            state.isCollapsed = !state.isCollapsed;
+            if (state.isCollapsed) {
+                body.style.display = "none";
+                collapseBtn.textContent = "+";
+                widget.style.minWidth = "180px";
+            } else {
+                body.style.display = "block";
+                collapseBtn.textContent = "−";
+                widget.style.minWidth = "240px";
+            }
+        });
+
+        // Elapsed Timer
+        const startMs = Date.parse(state.meetingStartTimestamp);
+        state.timerInterval = setInterval(() => {
+            const elapsedSec = Math.floor((Date.now() - startMs) / 1000);
+            const mins = String(Math.floor(elapsedSec / 60)).padStart(2, "0");
+            const secs = String(elapsedSec % 60).padStart(2, "0");
+            timer.textContent = `${mins}:${secs}`;
+        }, 1000);
+    }
+
+    function makeDraggable(el) {
+        let isDragging = false, startX, startY, origX, origY;
+        el.addEventListener("mousedown", (e) => {
+            if (["BUTTON", "INPUT", "TEXTAREA"].includes(e.target.tagName)) return;
+            isDragging = true;
+            startX = e.clientX; startY = e.clientY;
+            const rect = el.getBoundingClientRect();
+            origX = rect.left; origY = rect.top;
+            el.style.bottom = "auto";
+            el.style.left = `${origX}px`;
+            el.style.top = `${origY}px`;
+
+            const onMouseMove = (ev) => {
+                if (!isDragging) return;
+                el.style.left = `${Math.max(10, Math.min(window.innerWidth - el.offsetWidth - 10, origX + (ev.clientX - startX)))}px`;
+                el.style.top = `${Math.max(10, Math.min(window.innerHeight - el.offsetHeight - 10, origY + (ev.clientY - startY)))}px`;
+            };
+            const onMouseUp = () => {
+                isDragging = false;
+                document.removeEventListener("mousemove", onMouseMove);
+                document.removeEventListener("mouseup", onMouseUp);
+            };
+            document.addEventListener("mousemove", onMouseMove);
+            document.addEventListener("mouseup", onMouseUp);
+        });
+    }
+
+    function updateUI() {
+        if (!state.uiElement) return;
+        const counterEl = state.uiElement.querySelector("#tt-counter");
+        const speakerEl = state.uiElement.querySelector("#tt-speaker");
+        if (counterEl) {
+            const { totalWords, totalBlocks } = computeAnalytics();
+            counterEl.textContent = `${totalBlocks} turns • ${totalWords} w`;
+        }
+        if (speakerEl) {
+            const curSpeaker = state.stateTranscriptBlock.personName;
+            speakerEl.textContent = curSpeaker ? `${curSpeaker}...` : "";
+        }
+    }
+
+    // Public API
+    const api = {
+        downloadTxt: () => triggerExport("txt"),
+        downloadMd: () => triggerExport("md"),
+        downloadJson: () => triggerExport("json"),
+        copyTxt: () => copyToClipboard(formatAsTxt(), "Plain Text"),
+        copyMd: () => copyToClipboard(formatAsMarkdown(), "Markdown"),
+        toggleStealth: toggleCaptionVisibility,
+        stop: () => stopAndExport(true),
+        getAnalytics: computeAnalytics,
+        getData: () => ({ ...state, analytics: computeAnalytics() }),
+        recover: () => {
+            try {
+                const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || "null");
+                if (saved && (saved.transcript?.length > 0 || saved.chatMessages?.length > 0)) {
+                    state.meetingTitle = saved.meetingTitle;
+                    state.transcript = saved.transcript;
+                    state.chatMessages = saved.chatMessages;
+                    triggerExport("md");
+                    showToast("Recovered session exported!");
+                } else {
+                    alert("No previous session found in localStorage.");
+                }
+            } catch (e) {
+                console.error("[TranscripTonic Pro] Recovery error:", e);
+            }
+        },
+        help: () => {
+            console.log("%c--- TranscripTonic Pro Controls ---", "color: #2A9ACA; font-weight: bold;");
+            console.table({
+                "meetTranscript.downloadTxt()": "Download formatted .txt file",
+                "meetTranscript.downloadMd()": "Download rich Markdown (.md) document with stats",
+                "meetTranscript.downloadJson()": "Download raw JSON dataset",
+                "meetTranscript.copyTxt()": "Copy plain text transcript to clipboard",
+                "meetTranscript.copyMd()": "Copy markdown transcript to clipboard",
+                "meetTranscript.toggleStealth()": "Hide/Show captions from screen while transcribing",
+                "meetTranscript.getAnalytics()": "Print live talk-time & word count per speaker",
+                "meetTranscript.stop()": "Stop recording and download final transcript",
+                "meetTranscript.recover()": "Recover last session from localStorage"
+            });
+        }
+    };
+
+    window.__transcriptonicPro = api;
+    window.meetTranscript = api;
+
+    detectUserName();
+    detectMeetingTitle();
+    ensureCaptionsTurnedOn();
+    startTranscriptMonitor();
+    initChat();
+    setupCallEndDetection();
+    renderFloatingUI();
+
+    setTimeout(() => {
+        detectMeetingTitle();
+        detectUserName();
+    }, 4000);
+
+    console.log(
+        `%c🎙️ TranscripTonic Pro Active!%c\n- Exports: %c.txt%c, %c.md%c, %c.json%c\n- Stealth Mode: Hide on-screen captions anytime\n- Type %cmeetTranscript.help()%c for commands`,
+        "color: #2A9ACA; font-size: 14px; font-weight: bold;",
+        "color: #e8eaed;",
+        "color: #8ab4f8; font-weight: bold;", "color: #e8eaed;",
+        "color: #8ab4f8; font-weight: bold;", "color: #e8eaed;",
+        "color: #8ab4f8; font-weight: bold;", "color: #e8eaed;",
+        "color: #fbbc04; font-weight: bold;", "color: #e8eaed;"
+    );
+})();
