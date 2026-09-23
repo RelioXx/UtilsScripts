@@ -1,0 +1,609 @@
+/**
+ * TranscripTonic - Standalone Google Meet Console Transcription Script
+ * Completely self-contained: no chrome.* APIs, zero external network requests (strict CSP-compliant).
+ */
+(() => {
+    // Stop any previously running instance in the same tab
+    if (window.__transcriptonicInstance) {
+        console.log("%c[TranscripTonic] Stopping previous instance...", "color: #FFA500; font-weight: bold;");
+        window.__transcriptonicInstance.stop(false);
+    }
+
+    const SELECTORS = {
+        USER_NAME: ".awLEm",
+        MEETING_TITLE: ".u6vdEc",
+        GOOGLE_SYMBOLS: ".google-symbols",
+        TEXT_CALL_END: "call_end",
+        TEXT_CAPTIONS_OFF: "closed_caption_off",
+        TEXT_CAPTIONS_ON: "closed_caption",
+        TEXT_CHAT: "chat",
+        TRANSCRIPT_REGION: 'div[role="region"][tabindex="0"]',
+        CHAT_LIVE_REGION: 'div[aria-live="polite"].Ge9Kpc'
+    };
+
+    const TIMEFORMAT = {
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+        hour12: true
+    };
+
+    const mutationConfig = {
+        childList: true,
+        attributes: true,
+        subtree: true,
+        characterData: true
+    };
+
+    const STORAGE_KEY = "transcriptonic_active_session";
+    const HISTORY_KEY = "transcriptonic_history";
+
+    const state = {
+        meetingSoftware: "Google Meet",
+        userName: "You",
+        transcript: [],
+        chatMessages: [],
+        stateTranscriptBlock: {
+            timestamp: "",
+            mutationTargetElement: null,
+            personName: "",
+            transcriptTextBuffer: ""
+        },
+        meetingStartTimestamp: new Date().toISOString(),
+        meetingTitle: document.title || "Meeting",
+        transcriptTargetNode: null,
+        transcriptObserver: null,
+        chatMessagesTargetNode: null,
+        chatMessagesObserver: null,
+        hasMeetingEnded: false,
+        monitorInterval: null,
+        chatMonitorInterval: null,
+        uiElement: null
+    };
+
+    function saveToStorage() {
+        try {
+            const payload = {
+                meetingSoftware: state.meetingSoftware,
+                meetingTitle: state.meetingTitle,
+                meetingStartTimestamp: state.meetingStartTimestamp,
+                transcript: state.transcript,
+                chatMessages: state.chatMessages,
+                lastUpdated: new Date().toISOString()
+            };
+            localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
+        } catch (e) {}
+    }
+
+    function detectMeetingTitle() {
+        const titleEl = document.querySelector(SELECTORS.MEETING_TITLE);
+        if (titleEl && titleEl.innerText?.trim()) {
+            state.meetingTitle = titleEl.innerText.trim();
+        } else if (document.title && document.title !== "Meet") {
+            state.meetingTitle = document.title;
+        } else {
+            const pathCode = window.location.pathname.replace(/^\//, "");
+            if (pathCode) state.meetingTitle = `Meeting ${pathCode}`;
+        }
+    }
+
+    function detectUserName() {
+        const userEl = document.querySelector(SELECTORS.USER_NAME);
+        if (userEl && userEl.textContent?.trim()) {
+            state.userName = userEl.textContent.trim();
+        }
+    }
+
+    function pushBufferToTranscript() {
+        if (state.stateTranscriptBlock.personName && state.stateTranscriptBlock.transcriptTextBuffer) {
+            const rawName = state.stateTranscriptBlock.personName.trim();
+            const personName = (rawName === "You" || rawName.toLowerCase() === "you")
+                ? state.userName
+                : rawName;
+
+            const cleanText = state.stateTranscriptBlock.transcriptTextBuffer.trim();
+            if (cleanText) {
+                state.transcript.push({
+                    personName: personName,
+                    timestamp: state.stateTranscriptBlock.timestamp || new Date().toISOString(),
+                    transcriptText: cleanText
+                });
+                saveToStorage();
+                updateUI();
+            }
+        }
+    }
+
+    function transcriptMutationCallback(mutationsList) {
+        mutationsList.forEach((mutation) => {
+            try {
+                if (mutation.type === "characterData") {
+                    const mutationTargetElement = mutation.target.parentElement;
+                    if (!mutationTargetElement) return;
+
+                    const transcriptUIBlocks = [...mutationTargetElement.parentElement?.parentElement?.children || []];
+                    const isLastButSecondElement = transcriptUIBlocks.length >= 3
+                        ? transcriptUIBlocks[transcriptUIBlocks.length - 3] === mutationTargetElement.parentElement
+                        : (transcriptUIBlocks.length > 0 && transcriptUIBlocks[transcriptUIBlocks.length - 1] === mutationTargetElement.parentElement);
+
+                    if (isLastButSecondElement) {
+                        const currentPersonName = mutationTargetElement.previousSibling?.textContent?.trim();
+                        const currentTranscriptText = mutationTargetElement.textContent;
+
+                        if (currentPersonName && currentTranscriptText) {
+                            if (!state.stateTranscriptBlock.mutationTargetElement) {
+                                state.stateTranscriptBlock.mutationTargetElement = mutationTargetElement;
+                                state.stateTranscriptBlock.personName = currentPersonName;
+                                state.stateTranscriptBlock.timestamp = new Date().toISOString();
+                                state.stateTranscriptBlock.transcriptTextBuffer = currentTranscriptText;
+                            } else {
+                                if (state.stateTranscriptBlock.mutationTargetElement !== mutationTargetElement) {
+                                    pushBufferToTranscript();
+
+                                    state.stateTranscriptBlock.mutationTargetElement = mutationTargetElement;
+                                    state.stateTranscriptBlock.personName = currentPersonName;
+                                    state.stateTranscriptBlock.timestamp = new Date().toISOString();
+                                    state.stateTranscriptBlock.transcriptTextBuffer = currentTranscriptText;
+                                } else {
+                                    if ((currentTranscriptText.length - state.stateTranscriptBlock.transcriptTextBuffer.length) < -250) {
+                                        pushBufferToTranscript();
+                                        state.stateTranscriptBlock.mutationTargetElement = mutationTargetElement;
+                                        state.stateTranscriptBlock.timestamp = new Date().toISOString();
+                                    }
+                                    state.stateTranscriptBlock.transcriptTextBuffer = currentTranscriptText;
+                                }
+                            }
+                            updateUI();
+                        } else {
+                            pushBufferToTranscript();
+                            state.stateTranscriptBlock.mutationTargetElement = null;
+                            state.stateTranscriptBlock.personName = "";
+                            state.stateTranscriptBlock.transcriptTextBuffer = "";
+                            updateUI();
+                        }
+                    }
+                }
+            } catch (err) {
+                console.error("[TranscripTonic] Transcript parse error:", err);
+            }
+        });
+    }
+
+    function startTranscriptMonitor() {
+        state.transcriptTargetNode = null;
+
+        function checkNode() {
+            if (state.hasMeetingEnded) return;
+
+            const activeNode = document.querySelector(SELECTORS.TRANSCRIPT_REGION);
+            if (!activeNode) return;
+
+            if (!state.transcriptTargetNode || activeNode !== state.transcriptTargetNode || !state.transcriptTargetNode.isConnected) {
+                if (!state.transcriptTargetNode) {
+                    console.log("%c[TranscripTonic] Captions region detected. Observer attached!", "color: #2A9ACA; font-weight: bold;");
+                } else {
+                    console.log("%c[TranscripTonic] Captions region updated. Re-attached observer.", "color: #2A9ACA; font-weight: bold;");
+                }
+
+                pushBufferToTranscript();
+                state.stateTranscriptBlock.personName = "";
+                state.stateTranscriptBlock.transcriptTextBuffer = "";
+                state.stateTranscriptBlock.timestamp = "";
+
+                if (state.transcriptObserver) {
+                    state.transcriptObserver.disconnect();
+                }
+
+                state.transcriptTargetNode = activeNode;
+                state.transcriptObserver = new MutationObserver(transcriptMutationCallback);
+                state.transcriptObserver.observe(activeNode, mutationConfig);
+                updateUI();
+            }
+        }
+
+        checkNode();
+        state.monitorInterval = setInterval(checkNode, 1500);
+    }
+
+    function chatMessagesMutationCallback() {
+        try {
+            const chatMessagesElement = document.querySelector(SELECTORS.CHAT_LIVE_REGION);
+            if (chatMessagesElement && chatMessagesElement.children.length > 0) {
+                const chatMessageElement = chatMessagesElement.lastChild?.firstChild?.firstChild?.lastChild;
+                const personAndTimestampElement = chatMessageElement?.firstChild;
+                const personName = (personAndTimestampElement?.childNodes.length === 1)
+                    ? state.userName
+                    : personAndTimestampElement?.firstChild?.textContent?.trim();
+                const timestamp = new Date().toISOString();
+                const chatMessageText = chatMessageElement?.lastChild?.lastChild?.firstChild?.firstChild?.firstChild?.textContent?.trim();
+
+                if (personName && chatMessageText) {
+                    const isExisting = state.chatMessages.some(m =>
+                        m.personName === personName && m.chatMessageText === chatMessageText
+                    );
+                    if (!isExisting) {
+                        state.chatMessages.push({ personName, timestamp, chatMessageText });
+                        console.log(`%c[TranscripTonic Chat] ${personName}: ${chatMessageText}`, "color: #34A853;");
+                        saveToStorage();
+                        updateUI();
+                    }
+                }
+            }
+        } catch (err) {
+            console.error("[TranscripTonic] Chat message parse error:", err);
+        }
+    }
+
+    function initChat() {
+        function hookChatNode() {
+            const chatNode = document.querySelector(SELECTORS.CHAT_LIVE_REGION);
+            if (chatNode && chatNode !== state.chatMessagesTargetNode) {
+                if (state.chatMessagesObserver) {
+                    state.chatMessagesObserver.disconnect();
+                }
+                state.chatMessagesTargetNode = chatNode;
+                state.chatMessagesObserver = new MutationObserver(chatMessagesMutationCallback);
+                state.chatMessagesObserver.observe(chatNode, mutationConfig);
+                console.log("%c[TranscripTonic] Chat listener active.", "color: #2A9ACA; font-weight: bold;");
+            }
+        }
+
+        const chatNode = document.querySelector(SELECTORS.CHAT_LIVE_REGION);
+        if (!chatNode) {
+            const chatButtons = Array.from(document.querySelectorAll(SELECTORS.GOOGLE_SYMBOLS))
+                .filter(el => el.textContent?.trim() === SELECTORS.TEXT_CHAT);
+            if (chatButtons.length > 0) {
+                const btn = chatButtons[0].closest("button") || chatButtons[0];
+                btn.click();
+                setTimeout(() => {
+                    hookChatNode();
+                    btn.click();
+                }, 350);
+            }
+        } else {
+            hookChatNode();
+        }
+
+        state.chatMonitorInterval = setInterval(hookChatNode, 3000);
+    }
+
+    function ensureCaptionsTurnedOn() {
+        const offIcons = Array.from(document.querySelectorAll(SELECTORS.GOOGLE_SYMBOLS))
+            .filter(el => el.textContent?.trim() === SELECTORS.TEXT_CAPTIONS_OFF);
+
+        if (offIcons.length > 0) {
+            console.log("%c[TranscripTonic] Automatically enabling Captions (CC)...", "color: #2A9ACA; font-weight: bold;");
+            const btn = offIcons[0].closest("button") || offIcons[0];
+            btn.click();
+        } else {
+            const onIcons = Array.from(document.querySelectorAll(SELECTORS.GOOGLE_SYMBOLS))
+                .filter(el => el.textContent?.trim() === SELECTORS.TEXT_CAPTIONS_ON);
+            if (onIcons.length > 0) {
+                console.log("%c[TranscripTonic] Captions are already ON.", "color: #34A853; font-weight: bold;");
+            } else {
+                console.warn("%c[TranscripTonic] Please ensure Captions (CC) are enabled in Google Meet.", "color: #FFA500; font-weight: bold;");
+            }
+        }
+    }
+
+    function getTranscriptString(transcript) {
+        let transcriptString = "";
+        if (transcript && transcript.length > 0) {
+            transcript.forEach(block => {
+                const time = new Date(block.timestamp).toLocaleString("default", TIMEFORMAT).toUpperCase();
+                transcriptString += `${block.personName} (${time})\n`;
+                transcriptString += block.transcriptText;
+                transcriptString += "\n\n";
+            });
+        }
+        return transcriptString;
+    }
+
+    function getChatMessagesString(chatMessages) {
+        let chatMessagesString = "";
+        if (chatMessages && chatMessages.length > 0) {
+            chatMessages.forEach(msg => {
+                const time = new Date(msg.timestamp).toLocaleString("default", TIMEFORMAT).toUpperCase();
+                chatMessagesString += `${msg.personName} (${time})\n`;
+                chatMessagesString += msg.chatMessageText;
+                chatMessagesString += "\n\n";
+            });
+        }
+        return chatMessagesString;
+    }
+
+    function buildExportContent() {
+        let content = getTranscriptString(state.transcript);
+        content += `\n---------------\nCHAT MESSAGES\n---------------\n\n`;
+        content += getChatMessagesString(state.chatMessages);
+        content += `\n---------------\nTranscript saved using TranscripTonic (Console Script)\n---------------`;
+        return content;
+    }
+
+    function getExportFileName() {
+        const invalidFilenameRegex = /[:?"*<>|~/\\\u{1}-\u{1f}\u{7f}\u{80}-\u{9f}\p{Cf}\p{Cn}]|^[.\u{0}\p{Zl}\p{Zp}\p{Zs}]|[.\u{0}\p{Zl}\p{Zp}\p{Zs}]$|^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?=\.|$)/gui;
+        const title = (state.meetingTitle || "Meeting").replaceAll(invalidFilenameRegex, "_").trim();
+        const timestamp = new Date(state.meetingStartTimestamp);
+        const formattedTimestamp = timestamp.toLocaleString("default", TIMEFORMAT).replace(/[\/:]/g, "-");
+        return `Google Meet transcript-${title} at ${formattedTimestamp}.txt`;
+    }
+
+    function triggerDownload(fileName, content) {
+        const blob = new Blob([content], { type: "text/plain;charset=utf-8" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = fileName;
+        document.body.appendChild(a);
+        a.click();
+        setTimeout(() => {
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+        }, 1500);
+    }
+
+    function downloadTranscript() {
+        pushBufferToTranscript();
+        if (state.transcript.length === 0 && state.chatMessages.length === 0) {
+            console.warn("%c[TranscripTonic] Transcript is empty. No speech or chat captured yet.", "color: #FFA500; font-weight: bold;");
+            alert("TranscripTonic: Nothing captured yet. Ensure Captions (CC) are enabled.");
+            return;
+        }
+        const content = buildExportContent();
+        const fileName = getExportFileName();
+        triggerDownload(fileName, content);
+        console.log(`%c[TranscripTonic] Downloaded: ${fileName}`, "color: #34A853; font-weight: bold;");
+    }
+
+    function copyTranscriptToClipboard() {
+        pushBufferToTranscript();
+        const content = buildExportContent();
+        navigator.clipboard.writeText(content).then(() => {
+            console.log("%c[TranscripTonic] Transcript copied to clipboard!", "color: #34A853; font-weight: bold;");
+            showToast("Copied to clipboard!");
+        }).catch(err => {
+            console.error("[TranscripTonic] Clipboard copy failed:", err);
+            showToast("Clipboard copy failed. See console.");
+        });
+    }
+
+    function stopAndExport(autoDownload = true) {
+        if (state.hasMeetingEnded) return;
+        state.hasMeetingEnded = true;
+
+        if (state.monitorInterval) clearInterval(state.monitorInterval);
+        if (state.chatMonitorInterval) clearInterval(state.chatMonitorInterval);
+        if (state.transcriptObserver) state.transcriptObserver.disconnect();
+        if (state.chatMessagesObserver) state.chatMessagesObserver.disconnect();
+
+        pushBufferToTranscript();
+        saveToStorage();
+
+        try {
+            let history = JSON.parse(localStorage.getItem(HISTORY_KEY) || "[]");
+            history.push({
+                meetingSoftware: state.meetingSoftware,
+                meetingTitle: state.meetingTitle,
+                meetingStartTimestamp: state.meetingStartTimestamp,
+                meetingEndTimestamp: new Date().toISOString(),
+                transcript: state.transcript,
+                chatMessages: state.chatMessages
+            });
+            if (history.length > 10) history = history.slice(-10);
+            localStorage.setItem(HISTORY_KEY, JSON.stringify(history));
+        } catch (e) {}
+
+        if (autoDownload && (state.transcript.length > 0 || state.chatMessages.length > 0)) {
+            downloadTranscript();
+        }
+
+        if (state.uiElement) {
+            state.uiElement.remove();
+            state.uiElement = null;
+        }
+
+        console.log("%c[TranscripTonic] Stopped transcription.", "color: #2A9ACA; font-weight: bold;");
+    }
+
+    function setupCallEndDetection() {
+        const callEndIcons = Array.from(document.querySelectorAll(SELECTORS.GOOGLE_SYMBOLS))
+            .filter(el => el.textContent?.trim() === SELECTORS.TEXT_CALL_END);
+
+        if (callEndIcons.length > 0) {
+            const endBtn = callEndIcons[0].closest("button") || callEndIcons[0].parentElement?.parentElement;
+            endBtn?.addEventListener("click", () => {
+                console.log("%c[TranscripTonic] Leave call clicked. Auto-downloading transcript...", "color: #2A9ACA; font-weight: bold;");
+                stopAndExport(true);
+            }, { once: true });
+        }
+
+        window.addEventListener("beforeunload", () => {
+            pushBufferToTranscript();
+            saveToStorage();
+        });
+    }
+
+    function showToast(message) {
+        const toast = document.createElement("div");
+        toast.textContent = message;
+        toast.style.cssText = `
+            position: fixed;
+            top: 24px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: #202124;
+            color: #ffffff;
+            padding: 8px 18px;
+            border-radius: 8px;
+            font-size: 13px;
+            font-family: 'Google Sans', Roboto, sans-serif;
+            box-shadow: 0 4px 16px rgba(0,0,0,0.4);
+            border: 1px solid rgba(255,255,255,0.15);
+            z-index: 100000;
+            pointer-events: none;
+            transition: opacity 0.3s ease;
+        `;
+        document.body.appendChild(toast);
+        setTimeout(() => {
+            toast.style.opacity = "0";
+            setTimeout(() => toast.remove(), 300);
+        }, 2200);
+    }
+
+    function renderFloatingUI() {
+        const existing = document.getElementById("transcriptonic-console-widget");
+        if (existing) existing.remove();
+
+        const widget = document.createElement("div");
+        widget.id = "transcriptonic-console-widget";
+        widget.style.cssText = `
+            position: fixed;
+            bottom: 84px;
+            left: 20px;
+            background: #202124;
+            color: #e8eaed;
+            padding: 10px 14px;
+            border-radius: 12px;
+            font-family: 'Google Sans', Roboto, Arial, sans-serif;
+            font-size: 12px;
+            box-shadow: 0 6px 20px rgba(0,0,0,0.4);
+            border: 1px solid rgba(255,255,255,0.12);
+            z-index: 99999;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            user-select: none;
+            backdrop-filter: blur(8px);
+        `;
+
+        widget.innerHTML = `
+            <div style="display:flex; align-items:center; gap:6px;">
+                <span style="display:inline-block; width:8px; height:8px; border-radius:50%; background:#34A853; animation: tt-pulse 1.5s infinite;"></span>
+                <span style="font-weight:600; color:#ffffff; font-size:13px;">TranscripTonic</span>
+            </div>
+            <div id="tt-counter" style="color:#9aa0a6; font-size:11px; max-width:130px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">
+                0 blocks
+            </div>
+            <div style="display:flex; gap:6px;">
+                <button id="tt-download-btn" title="Download Transcript (.txt)" style="background:#2A9ACA; color:#fff; border:none; border-radius:6px; padding:4px 8px; cursor:pointer; font-weight:500; font-size:11px;">
+                    📥 Download
+                </button>
+                <button id="tt-copy-btn" title="Copy to Clipboard" style="background:#3c4043; color:#e8eaed; border:none; border-radius:6px; padding:4px 8px; cursor:pointer; font-size:11px;">
+                    📋 Copy
+                </button>
+                <button id="tt-stop-btn" title="Stop & Export" style="background:#ea4335; color:#fff; border:none; border-radius:6px; padding:4px 8px; cursor:pointer; font-size:11px;">
+                    ⏹️ Stop
+                </button>
+            </div>
+            <style>
+                @keyframes tt-pulse {
+                    0% { transform: scale(0.95); opacity: 0.8; }
+                    50% { transform: scale(1.2); opacity: 1; }
+                    100% { transform: scale(0.95); opacity: 0.8; }
+                }
+                #tt-download-btn:hover { background: #2380a8 !important; }
+                #tt-copy-btn:hover { background: #4f5358 !important; }
+                #tt-stop-btn:hover { background: #d93025 !important; }
+            </style>
+        `;
+
+        document.body.appendChild(widget);
+        state.uiElement = widget;
+
+        widget.querySelector("#tt-download-btn")?.addEventListener("click", () => downloadTranscript());
+        widget.querySelector("#tt-copy-btn")?.addEventListener("click", () => copyTranscriptToClipboard());
+        widget.querySelector("#tt-stop-btn")?.addEventListener("click", () => stopAndExport(true));
+    }
+
+    function updateUI() {
+        if (!state.uiElement) return;
+        const counterEl = state.uiElement.querySelector("#tt-counter");
+        if (counterEl) {
+            const count = state.transcript.length;
+            const currentSpeaker = state.stateTranscriptBlock.personName;
+            if (currentSpeaker) {
+                counterEl.textContent = `${count} blk • ${currentSpeaker}...`;
+            } else {
+                counterEl.textContent = `${count} blocks`;
+            }
+        }
+    }
+
+    const api = {
+        download: downloadTranscript,
+        copy: copyTranscriptToClipboard,
+        stop: () => stopAndExport(true),
+        getData: () => ({
+            title: state.meetingTitle,
+            userName: state.userName,
+            startTimestamp: state.meetingStartTimestamp,
+            transcript: [...state.transcript],
+            chat: [...state.chatMessages],
+            activeBuffer: { ...state.stateTranscriptBlock }
+        }),
+        getText: buildExportContent,
+        setUserName: (name) => {
+            if (name && typeof name === "string") {
+                state.userName = name.trim();
+                console.log(`%c[TranscripTonic] User name set to: ${state.userName}`, "color: #34A853;");
+            }
+        },
+        recover: () => {
+            try {
+                const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || "null");
+                if (saved && (saved.transcript?.length > 0 || saved.chatMessages?.length > 0)) {
+                    const content = getTranscriptString(saved.transcript) +
+                        `\n---------------\nCHAT MESSAGES\n---------------\n\n` +
+                        getChatMessagesString(saved.chatMessages) +
+                        `\n---------------\nRecovered Transcript from TranscripTonic\n---------------`;
+                    const filename = `Recovered-${(saved.meetingTitle || "Meeting").replace(/\s+/g, "_")}.txt`;
+                    triggerDownload(filename, content);
+                    console.log(`%c[TranscripTonic] Recovered session downloaded: ${filename}`, "color: #34A853; font-weight: bold;");
+                } else {
+                    console.warn("[TranscripTonic] No active session found in localStorage to recover.");
+                    alert("No session found in local storage.");
+                }
+            } catch (err) {
+                console.error("[TranscripTonic] Recovery error:", err);
+            }
+        },
+        help: () => {
+            console.log("%c--- TranscripTonic Console Commands ---", "color: #2A9ACA; font-weight: bold;");
+            console.table({
+                "meetTranscript.download()": "Downloads the formatted .txt transcript immediately",
+                "meetTranscript.copy()": "Copies transcript text to clipboard",
+                "meetTranscript.stop()": "Stops transcription and triggers download",
+                "meetTranscript.getData()": "Returns full JS object containing transcript & chat arrays",
+                "meetTranscript.getText()": "Returns the formatted transcript text as a string",
+                "meetTranscript.recover()": "Recovers last active session from localStorage",
+                "meetTranscript.setUserName('Name')": "Manually sets your name (replaces 'You')"
+            });
+        }
+    };
+
+    window.__transcriptonicInstance = api;
+    window.meetTranscript = api;
+
+    detectUserName();
+    detectMeetingTitle();
+    ensureCaptionsTurnedOn();
+    startTranscriptMonitor();
+    initChat();
+    setupCallEndDetection();
+    renderFloatingUI();
+
+    setTimeout(() => {
+        detectMeetingTitle();
+        detectUserName();
+    }, 4000);
+
+    console.log(
+        `%c🎙️ TranscripTonic is active!%c\n- Captions are being monitored.\n- Floating control widget is visible in the bottom-left.\n- Run %cmeetTranscript.help()%c for console options.`,
+        "color: #2A9ACA; font-size: 14px; font-weight: bold;",
+        "color: #e8eaed;",
+        "color: #34A853; font-weight: bold;",
+        "color: #e8eaed;"
+    );
+})();
